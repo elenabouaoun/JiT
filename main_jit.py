@@ -20,6 +20,12 @@ from engine_jit import train_one_epoch, evaluate
 from denoiser import Denoiser
 
 
+def effective_batch_size(args, world_size):
+    if args.batch_size < 1 or args.accum_steps < 1 or world_size < 1:
+        raise ValueError('batch_size, accum_steps and world_size must be positive')
+    return args.batch_size * args.accum_steps * world_size
+
+
 def get_args_parser():
     parser = argparse.ArgumentParser('JiT', add_help=False)
 
@@ -36,6 +42,8 @@ def get_args_parser():
                         help='Epochs to warm up LR')
     parser.add_argument('--batch_size', default=128, type=int,
                         help='Batch size per GPU (effective batch size = batch_size * # GPUs)')
+    parser.add_argument('--accum_steps', default=1, type=int,
+                        help='Microbatches per optimizer and EMA update')
     parser.add_argument('--lr', type=float, default=None, metavar='LR',
                         help='Learning rate (absolute)')
     parser.add_argument('--blr', type=float, default=5e-5, metavar='LR',
@@ -113,6 +121,7 @@ def get_args_parser():
 
 
 def main(args):
+    effective_batch_size(args, 1)  # Validate before distributed initialization.
     misc.init_distributed_mode(args)
     print('Job directory:', os.path.dirname(os.path.realpath(__file__)))
     print("Arguments:\n{}".format(args).replace(', ', ',\n'))
@@ -130,8 +139,19 @@ def main(args):
     global_rank = misc.get_rank()
 
     # Set up TensorBoard logging (only on main process)
+    # Resumes read the old directory and must write into a fresh output directory.
+    # Broadcast creation failures so peers do not hang waiting at their first DDP op.
+    output_error = [None]
     if global_rank == 0 and args.output_dir is not None:
-        os.makedirs(args.output_dir, exist_ok=True)
+        try:
+            Path(args.output_dir).mkdir(parents=True, exist_ok=False)
+        except OSError as error:
+            output_error[0] = str(error)
+    if args.distributed:
+        torch.distributed.broadcast_object_list(output_error, src=0)
+    if output_error[0] is not None:
+        raise RuntimeError(f'Output directory must be new: {output_error[0]}')
+    if global_rank == 0 and args.output_dir is not None:
         log_writer = SummaryWriter(log_dir=args.output_dir)
     else:
         log_writer = None
@@ -171,7 +191,7 @@ def main(args):
 
     model.to(device)
 
-    eff_batch_size = args.batch_size * misc.get_world_size()
+    eff_batch_size = effective_batch_size(args, misc.get_world_size())
     if args.lr is None:  # only base_lr (blr) is specified
         args.lr = args.blr * eff_batch_size / 256
 
@@ -262,5 +282,4 @@ def main(args):
 
 if __name__ == '__main__':
     args = get_args_parser().parse_args()
-    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     main(args)

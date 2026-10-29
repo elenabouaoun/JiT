@@ -1,5 +1,6 @@
 import math
-import sys
+import time
+from contextlib import nullcontext
 import os
 import shutil
 
@@ -13,55 +14,97 @@ import torch_fidelity
 import copy
 
 
-def train_one_epoch(model, model_without_ddp, data_loader, optimizer, device, epoch, log_writer=None, args=None):
+def train_one_epoch(model, model_without_ddp, data_loader, optimizer, device, epoch,
+                    log_writer=None, args=None, max_optimizer_steps=None,
+                    warmup_steps=0, step_callback=None):
+    """Accumulate sample-weighted gradients, including a final short window.
+
+    DDP ranks must consume equal-sized batches (as with DistributedSampler).
+    max_optimizer_steps bounds pilots; this function never writes checkpoints.
+    """
+    device = torch.device(device)
+    accum_steps = getattr(args, 'accum_steps', 1)
+    if accum_steps < 1 or len(data_loader) == 0:
+        raise ValueError('Positive accum_steps and a nonempty data loader are required')
+    if max_optimizer_steps is not None and max_optimizer_steps < 1:
+        raise ValueError('max_optimizer_steps must be positive')
     model.train(True)
-    metric_logger = misc.MetricLogger(delimiter="  ")
-    metric_logger.add_meter('lr', misc.SmoothedValue(window_size=1, fmt='{value:.6f}'))
-    header = 'Epoch: [{}]'.format(epoch)
-    print_freq = 20
+    optimizer.zero_grad(set_to_none=True)
+    if device.type == 'cuda':
+        torch.cuda.synchronize(device)
+        torch.cuda.reset_peak_memory_stats(device)
+    started = time.perf_counter()
+    window_samples = 0
+    window_loss = 0.0
+    updates = 0
+    records = []
+    updates_per_epoch = math.ceil(len(data_loader) / accum_steps)
 
-    optimizer.zero_grad()
-
-    if log_writer is not None:
-        print('log_dir: {}'.format(log_writer.log_dir))
-
-    for data_iter_step, (x, labels) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
-        # per iteration (instead of per epoch) lr scheduler
-        lr_sched.adjust_learning_rate(optimizer, data_iter_step / len(data_loader) + epoch, args)
-
-        # normalize image to [-1, 1]
-        x = x.to(device, non_blocking=True).to(torch.float32).div_(255)
-        x = x * 2.0 - 1.0
+    for data_iter_step, (x, labels) in enumerate(data_loader):
+        if data_iter_step % accum_steps == 0:
+            lr_sched.adjust_learning_rate(optimizer, epoch + data_iter_step / len(data_loader), args)
+        boundary = ((data_iter_step + 1) % accum_steps == 0 or
+                    data_iter_step + 1 == len(data_loader))
+        sync = nullcontext() if boundary or not hasattr(model, 'no_sync') else model.no_sync()
+        x = x.to(device, non_blocking=True).to(torch.float32).div_(255).mul_(2).sub_(1)
         labels = labels.to(device, non_blocking=True)
+        batch_samples = x.size(0)
+        # no_sync must cover both forward and backward.
+        with sync:
+            autocast = (torch.amp.autocast('cuda', dtype=torch.bfloat16)
+                        if device.type == 'cuda' else nullcontext())
+            with autocast:
+                loss = model(x, labels)
+            loss_value = misc.all_reduce_mean(loss.detach().item())
+            if not math.isfinite(loss_value):
+                raise FloatingPointError(f'Nonfinite training loss: {loss_value}')
+            (loss * batch_samples).backward()
+        window_samples += batch_samples
+        window_loss += loss_value * batch_samples
+        if not boundary:
+            continue
 
-        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-            loss = model(x, labels)
-
-        loss_value = loss.item()
-        if not math.isfinite(loss_value):
-            print("Loss is {}, stopping training".format(loss_value))
-            sys.exit(1)
-
-        optimizer.zero_grad()
-        loss.backward()
+        for parameter in model.parameters():
+            if parameter.grad is not None:
+                parameter.grad.div_(window_samples)
         optimizer.step()
-
-        torch.cuda.synchronize()
-
+        optimizer.zero_grad(set_to_none=True)
         model_without_ddp.update_ema()
-
-        metric_logger.update(loss=loss_value)
-        lr = optimizer.param_groups[0]["lr"]
-        metric_logger.update(lr=lr)
-
-        loss_value_reduce = misc.all_reduce_mean(loss_value)
-
+        if device.type == 'cuda':
+            torch.cuda.synchronize(device)
+        elapsed = time.perf_counter() - started
+        updates += 1
+        record = dict(optimizer_step=updates, loss=window_loss / window_samples,
+                      lr=optimizer.param_groups[0]['lr'], seconds=elapsed,
+                      images=window_samples * misc.get_world_size(),
+                      warmup=updates <= warmup_steps)
+        record['images_per_second'] = record['images'] / elapsed
+        if device.type == 'cuda':
+            record.update(peak_allocated_bytes=torch.cuda.max_memory_allocated(device),
+                          peak_reserved_bytes=torch.cuda.max_memory_reserved(device))
+        records.append(record)
+        if step_callback is not None:
+            step_callback(record)
+        if (updates - 1) % args.log_freq == 0:
+            print(f'Epoch {epoch} update {updates}: loss={record["loss"]:.6f}, '
+                  f'images/s={record["images_per_second"]:.2f}')
         if log_writer is not None:
-            # Use epoch_1000x as the x-axis in TensorBoard to calibrate curves.
-            epoch_1000x = int((data_iter_step / len(data_loader) + epoch) * 1000)
-            if data_iter_step % args.log_freq == 0:
-                log_writer.add_scalar('train_loss', loss_value_reduce, epoch_1000x)
-                log_writer.add_scalar('lr', lr, epoch_1000x)
+            step = epoch * updates_per_epoch + updates
+            log_writer.add_scalar('train_loss', record['loss'], step)
+            log_writer.add_scalar('lr', record['lr'], step)
+        window_samples = 0
+        window_loss = 0.0
+        if max_optimizer_steps is not None and updates >= max_optimizer_steps:
+            break
+        started = time.perf_counter()
+
+    measured = [record for record in records if not record['warmup']]
+    seconds = sum(record['seconds'] for record in measured)
+    return dict(optimizer_steps=updates, measured_steps=len(measured),
+                images_per_second=sum(record['images'] for record in measured) / seconds if seconds else None,
+                mean_loss=(sum(record['loss'] * record['images'] for record in measured) /
+                           sum(record['images'] for record in measured)) if measured else None,
+                steps=records)
 
 
 def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None):
