@@ -1,6 +1,7 @@
 """Bounded, checkpoint-free Hellbender preflight and single-GPU pilots."""
 import argparse
 import copy
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -23,9 +24,44 @@ def checkpoint_hash(path):
     # Read-only: never deserialize, chmod, rename, copy over, or save a checkpoint.
     digest = hashlib.sha256()
     with path.open('rb') as stream:
+        before = os.fstat(stream.fileno())
         for block in iter(lambda: stream.read(8 * 1024 * 1024), b''):
             digest.update(block)
-    return dict(path=str(path.resolve()), bytes=path.stat().st_size, sha256=digest.hexdigest())
+        after = os.fstat(stream.fileno())
+    identity = lambda stat: (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+    if identity(before) != identity(after) or identity(after) != identity(path.stat()):
+        raise RuntimeError('Protected checkpoint changed while hashing')
+    return dict(path=str(path.resolve()), bytes=after.st_size, mtime_ns=after.st_mtime_ns,
+                sha256=digest.hexdigest())
+
+
+@contextmanager
+def verify_checkpoint_integrity(path, output, expected_sha256=None):
+    before = checkpoint_hash(path)
+    write_json(output / 'protected-checkpoint-before.json', before)
+    if expected_sha256 is not None and before['sha256'] != expected_sha256.lower():
+        raise RuntimeError('Protected checkpoint SHA-256 does not match the expected trusted digest')
+    try:
+        yield
+    finally:
+        # Also verify after ordinary failures (OOM, missing kernel, dataset errors).
+        # SIGKILL/scheduler termination cannot execute this guard.
+        after = checkpoint_hash(path)
+        write_json(output / 'protected-checkpoint-after.json', after)
+        if before != after:
+            raise RuntimeError('Protected checkpoint changed during the run')
+
+
+def verify_class_mappings(train, val, expected_classes=1000):
+    train_root, val_root = Path(train.root).resolve(), Path(val.root).resolve()
+    if train_root == val_root:
+        raise RuntimeError('Training and validation must use separate dataset directories')
+    if (len(train.classes) != expected_classes or len(val.classes) != expected_classes or
+            train.class_to_idx != val.class_to_idx or not len(train) or not len(val)):
+        raise RuntimeError(f'Expected matching nonempty ImageFolder train/val mappings with {expected_classes} classes')
+    return dict(train_images=len(train), val_images=len(val), class_mapping_match=True,
+                train_root=str(train_root), val_root=str(val_root),
+                train_class_to_idx=train.class_to_idx, val_class_to_idx=val.class_to_idx)
 
 
 def main():
@@ -35,6 +71,7 @@ def main():
     parser.add_argument('--output-root', type=Path, default=Path.home() / 'jit-experiments/pilots')
     parser.add_argument('--protected-checkpoint', type=Path,
                         default=Path.home() / 'JiT/checkpoints/jit-b-16/checkpoint-last.pth')
+    parser.add_argument('--expected-checkpoint-sha256', help='Optional trusted digest, in addition to before/after verification')
     parser.add_argument('--patch-size', type=int, choices=[2, 4, 8, 16], default=16)
     parser.add_argument('--batch-size', type=int, default=1)
     parser.add_argument('--accum-steps', type=int, default=1)
@@ -47,6 +84,10 @@ def main():
     if (cli.batch_size < 1 or cli.accum_steps < 1 or not 1 <= cli.steps <= 200 or
             not 0 <= cli.warmup_steps <= 50 or cli.num_workers < 0):
         parser.error('Invalid batch, accumulation, step, warmup, or worker count')
+    if cli.expected_checkpoint_sha256 is not None:
+        digest = cli.expected_checkpoint_sha256.lower()
+        if len(digest) != 64 or any(character not in '0123456789abcdef' for character in digest):
+            parser.error('Expected checkpoint SHA-256 must be 64 hexadecimal characters')
     # Set before importing decorated model modules. Eager is useful for first OOM pilots.
     os.environ['TORCH_COMPILE_DISABLE'] = '0' if cli.compile else '1'
     cli.data_path = cli.data_path.expanduser().resolve()
@@ -72,12 +113,19 @@ def main():
 
 
 def run(cli, output):
+    with verify_checkpoint_integrity(cli.protected_checkpoint, output, cli.expected_checkpoint_sha256):
+        summary = run_checks(cli, output)
+    write_json(output / 'summary.json', summary)
+    print(json.dumps({key: value for key, value in summary.items() if key != 'steps'}, indent=2), flush=True)
+
+
+def run_checks(cli, output):
     import torch
     import torchvision
     from PIL import Image
-    from torch.nn.attention import SDPBackend, sdpa_kernel
     from torchvision import datasets, transforms
     from util.crop import center_crop_arr
+    from util.attention_validation import flash_attention_only, validate_bf16_flash_attention
 
     if not torch.cuda.is_available() or not torch.cuda.is_bf16_supported():
         raise RuntimeError('A CUDA GPU with BF16 support is required; CPU wheels cannot run this pilot')
@@ -107,21 +155,19 @@ def run(cli, output):
                                                            '--format=csv,noheader'], text=True).strip(),
                        slurm_job_id=os.environ.get('SLURM_JOB_ID'))
     write_json(output / 'environment.json', environment)
-    before = checkpoint_hash(cli.protected_checkpoint.expanduser())
-    write_json(output / 'protected-checkpoint-before.json', before)
+    # Required for every pilot, not just when the user ran a separate preflight.
+    write_json(output / 'attention-validation.json', validate_bf16_flash_attention())
 
     transform = transforms.Compose([
         transforms.Lambda(lambda image: center_crop_arr(image, 128)),
         transforms.RandomHorizontalFlip(), transforms.PILToTensor()])
     train = datasets.ImageFolder(cli.data_path / 'train', transform=transform)
     val = datasets.ImageFolder(cli.data_path / 'val')
-    if len(train.classes) != 1000 or train.class_to_idx != val.class_to_idx:
-        raise RuntimeError('Expected matching ImageFolder train/val class mappings with 1,000 classes')
+    dataset_report = verify_class_mappings(train, val)
     for dataset in (train, val):
         with Image.open(dataset.samples[0][0]) as image:
             image.convert('RGB').load()
-    write_json(output / 'dataset.json', dict(train_images=len(train), val_images=len(val),
-                                           class_to_idx=train.class_to_idx))
+    write_json(output / 'dataset.json', dataset_report)
 
     if cli.mode == 'preflight':
         # Includes CUDA BF16 FlashAttention/reference output and gradient checks.
@@ -172,7 +218,7 @@ def run(cli, output):
                 stream.write(json.dumps(step, allow_nan=False) + '\n')
                 stream.flush()
             # Never allow a silent quadratic math-attention fallback.
-            with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+            with flash_attention_only():
                 summary = train_one_epoch(model, model, loader, optimizer, device, 0, args=args,
                                           max_optimizer_steps=total_steps, warmup_steps=cli.warmup_steps,
                                           step_callback=record)
@@ -180,12 +226,7 @@ def run(cli, output):
             raise RuntimeError('Pilot did not complete its requested updates')
         summary.update(status='passed', peak_allocated_bytes=torch.cuda.max_memory_allocated(),
                        peak_reserved_bytes=torch.cuda.max_memory_reserved(), checkpoints_written=False)
-    after = checkpoint_hash(cli.protected_checkpoint.expanduser())
-    write_json(output / 'protected-checkpoint-after.json', after)
-    if before != after:
-        raise RuntimeError('Protected checkpoint changed during the run')
-    write_json(output / 'summary.json', summary)
-    print(json.dumps({key: value for key, value in summary.items() if key != 'steps'}, indent=2), flush=True)
+    return summary
 
 
 if __name__ == '__main__':

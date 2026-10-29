@@ -102,7 +102,7 @@ def get_args_parser():
     parser.add_argument('--output_dir', default='./output_dir',
                         help='Directory to save outputs (empty for no saving)')
     parser.add_argument('--resume', default='',
-                        help='Folder that contains checkpoint to resume from')
+                        help='Explicit checkpoint file, or legacy folder containing checkpoint-last.pth')
     parser.add_argument('--save_last_freq', type=int, default=5,
                         help='Frequency (in epochs) to save checkpoints')
     parser.add_argument('--log_freq', default=100, type=int)
@@ -138,19 +138,9 @@ def main(args):
     num_tasks = misc.get_world_size()
     global_rank = misc.get_rank()
 
-    # Set up TensorBoard logging (only on main process)
-    # Resumes read the old directory and must write into a fresh output directory.
-    # Broadcast creation failures so peers do not hang waiting at their first DDP op.
-    output_error = [None]
-    if global_rank == 0 and args.output_dir is not None:
-        try:
-            Path(args.output_dir).mkdir(parents=True, exist_ok=False)
-        except OSError as error:
-            output_error[0] = str(error)
-    if args.distributed:
-        torch.distributed.broadcast_object_list(output_error, src=0)
-    if output_error[0] is not None:
-        raise RuntimeError(f'Output directory must be new: {output_error[0]}')
+    # Resumes read old artifacts and must write into a fresh output directory.
+    if args.output_dir is not None:
+        misc.create_output_directory(args.output_dir)
     if global_rank == 0 and args.output_dir is not None:
         log_writer = SummaryWriter(log_dir=args.output_dir)
     else:
@@ -208,8 +198,8 @@ def main(args):
     print(optimizer)
 
     # Resume from checkpoint if provided
-    checkpoint_path = os.path.join(args.resume, "checkpoint-last.pth") if args.resume else None
-    if checkpoint_path and os.path.exists(checkpoint_path):
+    checkpoint_path = resolve_resume_checkpoint(args.resume)
+    if checkpoint_path:
         checkpoint = torch.load(checkpoint_path, map_location='cpu')
         model_without_ddp.load_state_dict(checkpoint['model'])
 
@@ -248,16 +238,8 @@ def main(args):
         train_one_epoch(model, model_without_ddp, data_loader_train, optimizer, device, epoch, log_writer=log_writer, args=args)
 
         # Save checkpoint periodically
-        if epoch % args.save_last_freq == 0 or epoch + 1 == args.epochs:
-            misc.save_model(
-                args=args,
-                model_without_ddp=model_without_ddp,
-                optimizer=optimizer,
-                epoch=epoch,
-                epoch_name="last"
-            )
-
-        if epoch % 100 == 0 and epoch > 0:
+        if (epoch % args.save_last_freq == 0 or epoch + 1 == args.epochs or
+                (epoch % 100 == 0 and epoch > 0)):
             misc.save_model(
                 args=args,
                 model_without_ddp=model_without_ddp,
@@ -278,6 +260,17 @@ def main(args):
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time:', total_time_str)
+
+
+def resolve_resume_checkpoint(resume):
+    if not resume:
+        return None
+    path = Path(resume).expanduser()
+    if path.is_dir():
+        path = path / 'checkpoint-last.pth'
+    if not path.is_file():
+        raise FileNotFoundError(f'Requested resume checkpoint does not exist: {path}')
+    return path
 
 
 if __name__ == '__main__':

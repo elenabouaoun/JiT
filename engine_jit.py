@@ -2,7 +2,7 @@ import math
 import time
 from contextlib import nullcontext
 import os
-import shutil
+import uuid
 
 import torch
 import numpy as np
@@ -42,7 +42,11 @@ def train_one_epoch(model, model_without_ddp, data_loader, optimizer, device, ep
 
     for data_iter_step, (x, labels) in enumerate(data_loader):
         if data_iter_step % accum_steps == 0:
-            lr_sched.adjust_learning_rate(optimizer, epoch + data_iter_step / len(data_loader), args)
+            # Equal progression per optimizer update, including a short last window.
+            # With 5 microbatches and accum=2, updates occur at 0, 1/3, 2/3
+            # of the epoch, rather than 0, 2/5, 4/5 of the microbatch stream.
+            schedule_epoch = epoch + updates / updates_per_epoch
+            lr_sched.adjust_learning_rate(optimizer, schedule_epoch, args)
         boundary = ((data_iter_step + 1) % accum_steps == 0 or
                     data_iter_step + 1 == len(data_loader))
         sync = nullcontext() if boundary or not hasattr(model, 'no_sync') else model.no_sync()
@@ -75,10 +79,11 @@ def train_one_epoch(model, model_without_ddp, data_loader, optimizer, device, ep
         elapsed = time.perf_counter() - started
         updates += 1
         record = dict(optimizer_step=updates, loss=window_loss / window_samples,
-                      lr=optimizer.param_groups[0]['lr'], seconds=elapsed,
+                      lr=optimizer.param_groups[0]['lr'], schedule_epoch=schedule_epoch,
+                      training_pipeline_seconds=elapsed,
                       images=window_samples * misc.get_world_size(),
                       warmup=updates <= warmup_steps)
-        record['images_per_second'] = record['images'] / elapsed
+        record['training_pipeline_images_per_second'] = record['images'] / elapsed
         if device.type == 'cuda':
             record.update(peak_allocated_bytes=torch.cuda.max_memory_allocated(device),
                           peak_reserved_bytes=torch.cuda.max_memory_reserved(device))
@@ -87,7 +92,7 @@ def train_one_epoch(model, model_without_ddp, data_loader, optimizer, device, ep
             step_callback(record)
         if (updates - 1) % args.log_freq == 0:
             print(f'Epoch {epoch} update {updates}: loss={record["loss"]:.6f}, '
-                  f'images/s={record["images_per_second"]:.2f}')
+                  f'training-pipeline images/s={record["training_pipeline_images_per_second"]:.2f}')
         if log_writer is not None:
             step = epoch * updates_per_epoch + updates
             log_writer.add_scalar('train_loss', record['loss'], step)
@@ -99,9 +104,10 @@ def train_one_epoch(model, model_without_ddp, data_loader, optimizer, device, ep
         started = time.perf_counter()
 
     measured = [record for record in records if not record['warmup']]
-    seconds = sum(record['seconds'] for record in measured)
+    seconds = sum(record['training_pipeline_seconds'] for record in measured)
     return dict(optimizer_steps=updates, measured_steps=len(measured),
-                images_per_second=sum(record['images'] for record in measured) / seconds if seconds else None,
+                training_pipeline_images_per_second=sum(record['images'] for record in measured) / seconds if seconds else None,
+                timing_scope='data loading, H2D, forward/backward, optimizer, zero_grad, EMA, CUDA synchronization; excludes setup and logging',
                 mean_loss=(sum(record['loss'] * record['images'] for record in measured) /
                            sum(record['images'] for record in measured)) if measured else None,
                 steps=records)
@@ -122,9 +128,14 @@ def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None):
             model_without_ddp.cfg_interval[0], model_without_ddp.cfg_interval[1], args.num_images, args.img_size
         )
     )
+    # Never reuse or delete an earlier evaluation's samples.
+    destination = [None]
+    if misc.get_rank() == 0:
+        destination[0] = f'{save_folder}-epoch{epoch}-{uuid.uuid4().hex}'
+    torch.distributed.broadcast_object_list(destination, src=0)
+    save_folder = destination[0]
+    misc.create_output_directory(save_folder)
     print("Save to:", save_folder)
-    if misc.get_rank() == 0 and not os.path.exists(save_folder):
-        os.makedirs(save_folder)
 
     # switch to ema params, hard-coded to be the first one
     model_state_dict = copy.deepcopy(model_without_ddp.state_dict())
@@ -165,7 +176,11 @@ def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None):
                 break
             gen_img = np.round(np.clip(sampled_images[b_id].numpy().transpose([1, 2, 0]) * 255, 0, 255))
             gen_img = gen_img.astype(np.uint8)[:, :, ::-1]
-            cv2.imwrite(os.path.join(save_folder, '{}.png'.format(str(img_id).zfill(5))), gen_img)
+            success, encoded = cv2.imencode('.png', gen_img)
+            if not success:
+                raise RuntimeError('Failed to encode generated image')
+            with open(os.path.join(save_folder, '{}.png'.format(str(img_id).zfill(5))), 'xb') as image_file:
+                image_file.write(encoded.tobytes())
 
     torch.distributed.barrier()
 
@@ -198,6 +213,5 @@ def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None):
         log_writer.add_scalar('fid{}'.format(postfix), fid, epoch)
         log_writer.add_scalar('is{}'.format(postfix), inception_score, epoch)
         print("FID: {:.4f}, Inception Score: {:.4f}".format(fid, inception_score))
-        shutil.rmtree(save_folder)
 
     torch.distributed.barrier()

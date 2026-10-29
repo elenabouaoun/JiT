@@ -54,9 +54,13 @@ scripts fail clearly and never rearrange the source dataset.
 
 The protected checkpoint must exist at:
 `$HOME/JiT/checkpoints/jit-b-16/checkpoint-last.pth`. The scripts read its SHA-256
-before and after a successful run; they do not deserialize or write it. An explicit
+before and after both successful runs and ordinary exceptions; they do not
+deserialize or write it. They also detect changes during hashing. An explicit
 `--protected-checkpoint` can select another existing location if the checkout is
-elsewhere. This phase is not a checkpoint restart/recovery test.
+elsewhere. Add `--expected-checkpoint-sha256 <trusted-digest>` to verify against a
+known baseline as well. Before/after hashes prove stability, not that the original
+file has the correct model/schema or was uncorrupted before this task. SIGKILL
+cannot run the final integrity check. This phase is not a restart/recovery test.
 
 ## CPU validation
 
@@ -72,10 +76,22 @@ Tests cover FP32 SDPA output/input gradients against explicit attention, dropout
 mode, full B backbone specifications, small-model forward/backward at all four
 patch sizes, unchanged rotary checkpoint keys, accumulation equivalence to larger
 batches including short tails, optimizer/EMA counts, pilot bounds, and exclusive
-result writing. The CUDA-only test compares BF16 FlashAttention outputs and
-gradients with explicit FP32 attention using relative L2 tolerances of 2% and 3%.
+result writing. Further regressions check warmup/cosine LR against equivalent
+large batches, the complete training timing boundary, mismatched dataset class
+mappings, failure-path integrity checks, and concurrent checkpoint-publication
+collisions. The CUDA-only test compares BF16 FlashAttention outputs and gradients
+with explicit FP32 attention using relative L2 tolerances of 2% and 3%.
+It covers sequence lengths 96, 288, 1056, and 4128 (12 heads, head width 64), using
+16 query rows for the reference to avoid a dense 4128x4128 allocation. The loss
+uses those same rows, allowing comparison of the full Q/K/V gradients.
 It is skipped without CUDA and **required** during Slurm preflight. Small CPU
 models verify computation; full backbone shapes are inspected on the meta device.
+
+Every preflight **and every pilot** additionally runs this validation directly and
+saves errors in `attention-validation.json`. It restores the training RNG state.
+Both validation and pilot training permit only the FlashAttention backend; lack
+of a supported CUDA/BF16 kernel raises an explicit error, never a math fallback.
+Passing attention validation alone does not establish full-model memory feasibility.
 
 ## First preflight and GPU pilot
 
@@ -123,16 +139,24 @@ retain its failure evidence and assess activation checkpointing as a next change
 Every invocation exclusively creates a random-suffixed directory containing:
 
 - configuration, source commit/dirty status, GPU and dependency versions;
-- dataset counts and class mapping; checkpoint hashes before/after success;
+- dataset counts and both train/validation mappings, verified identical with 1,000
+  classes; checkpoint hashes before/after success or ordinary failure;
+- `attention-validation.json`: BF16/FP32 output and Q/K/V-gradient relative errors;
 - `steps.jsonl`: flushed per optimizer update, raw sample-mean training loss,
-  learning rate, images/second, elapsed seconds, and peak allocated/reserved bytes;
+  learning rate, schedule progress, `training_pipeline_images_per_second`,
+  `training_pipeline_seconds`, and peak allocated/reserved bytes;
 - `summary.json` after success, or `failure.json` after a Python exception.
 
 Training pilots default to 5 warmup plus 20 measured **optimizer** updates. Measured
 updates are capped at 200 and warmup at 50. Warmup updates perform real optimization
 but are excluded from throughput/loss summaries. Peak memory includes warmup,
-model, EMA, and lazy optimizer allocations. Timing synchronizes CUDA and includes
-data loading, forward/backward, accumulation, optimizer and EMA work. Slurm logs
+model, EMA, and lazy optimizer allocations. **Training-pipeline throughput** measures
+images divided by the sum of timed optimizer windows, not a mean of per-window
+rates. Timing begins before fetching data and ends after optimizer/zero-grad/EMA
+work and CUDA synchronization. It includes data loading, H2D transfers,
+forward/backward, accumulation, optimizer and EMA work. It excludes model/data
+setup, attention validation, checkpoint hashing, JSON/TensorBoard/console logging,
+and excluded timing-warmup updates. It is not whole-job walltime throughput. Slurm logs
 are separate and use unique log directories and job IDs. Hard scheduler kills may
 leave only partial JSONL and logs, rather than a failure/summary file.
 
@@ -149,9 +173,44 @@ sample-weighted, including short final batches/windows; optimizer and both EMAs
 advance once per window. DDP suppresses gradient synchronization before the
 window boundary. DDP ranks must have equal batch sizes, as with the existing
 DistributedSampler. The normal training entry point now refuses an existing output
-directory; resume input and output must be separate. Its legacy rolling saves
-within a new run remain outside this pilot's checkpoint-free path; immutable full
-training checkpoint management is a later phase.
+directory; resume input and output must be separate.
+
+### Epoch-based learning-rate progression with accumulation
+
+For `M` microbatches per epoch and accumulation factor `A`, let
+`U = ceil(M / A)` be the number of optimizer updates. Before update `u` (zero-based),
+the scheduler receives `epoch + u / U`. LR is held fixed across all microbatches
+in that update. A final partial accumulation window still counts as one update.
+For example, five microbatches with `A=2` use progress `0`, `1/3`, `2/3`, followed
+by `1` at the next epoch's first update; they do not use `0`, `2/5`, `4/5`.
+Thus changing microbatching while retaining the same effective batches and update
+count gives the same LR trajectory, including short tails.
+
+Warmup and cosine budgets remain expressed in epochs. With five warmup epochs,
+the first update has LR zero and base LR is reached at the first update of epoch
+index 5. Cosine is sampled at update starts, so the final update occurs before
+the mathematical end-of-training minimum. Resume at an epoch boundary preserves
+this progression when loader length and accumulation are unchanged. Mid-epoch
+restart and reproducible RNG restoration remain outside this phase. Pilot
+`--warmup-steps` controls timing exclusion only; pilot LR remains constant.
+
+### Checkpoint and legacy-evaluation safety
+
+Pilots remain entirely checkpoint-free. The legacy full-training saver now uses
+immutable `checkpoint-epoch000000.pth` names and creates a checkpoint at most once
+per selected epoch. It writes a private temporary file, flushes/fsyncs it, and
+publishes by an atomic no-clobber hard link. Existing files and symlinks, including
+`checkpoint-last.pth`, are never replaced; a collision or unsupported hard-link
+filesystem fails safely. Failed saves remove only their private temporary file.
+There is no automatic pruning. Select immutable resume files explicitly with
+`--resume /path/to/checkpoint-epoch000100.pth`; legacy directories containing
+`checkpoint-last.pth` still work. A requested missing checkpoint now fails instead
+of silently training from scratch.
+
+The pre-existing evaluation path also reserves a new UUID-suffixed directory per
+evaluation, creates image files exclusively, and retains samples after scoring.
+It cannot reuse or delete an earlier evaluation's images. This is a safety fix
+to legacy behavior, not implementation of the new denoising/generation pipeline.
 
 No full training, denoising metrics/panels, generation, FID, checkpoint loading,
 or restart validation is part of this phase.
