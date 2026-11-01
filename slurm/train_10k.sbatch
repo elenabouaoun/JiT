@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+#SBATCH --job-name=jit-b16-10k
+#SBATCH --account=general
+#SBATCH --partition=gpu
+#SBATCH --qos=normal
+#SBATCH --gres=gpu:A100:1
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=64G
+#SBATCH --time=04:00:00
+#SBATCH --output=/home/ebkmw/jit-experiments/training/jit-b16-10k/slurm-%j.log
+
+set -euo pipefail
+export MASTER_ADDR=127.0.0.1
+export MASTER_PORT=29500
+export RANK=0
+export WORLD_SIZE=1
+export LOCAL_RANK=0
+cd "$HOME/JiT"
+
+"$HOME/jit-pilot-env/bin/python" -u main_jit.py \
+  --model JiT-B/16 \
+  --img_size 128 \
+  --data_path "$HOME/data/imagenet-10k" \
+  --batch_size 4 \
+  --epochs 5 \
+  --save_last_freq 1 \
+  --output_dir "$HOME/jit-experiments/training/jit-b16-10k"

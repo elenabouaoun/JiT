@@ -105,7 +105,7 @@ def main():
     except BaseException as error:
         failure = dict(type=type(error).__name__, message=str(error))
         torch = sys.modules.get('torch')
-        if torch is not None and torch.cuda.is_initialized():
+        if torch is not None and torch.cuda.is_available() and torch.cuda.is_initialized():
             failure.update(peak_allocated_bytes=torch.cuda.max_memory_allocated(),
                            peak_reserved_bytes=torch.cuda.max_memory_reserved())
         write_json(output / 'failure.json', failure)

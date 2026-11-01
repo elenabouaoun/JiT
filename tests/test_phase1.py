@@ -362,7 +362,7 @@ class SafetyTests(unittest.TestCase):
             arguments = ['hpc_pilot.py', 'pilot', '--output-root', str(root / 'runs'),
                          '--protected-checkpoint', str(protected)]
             for _ in range(2):
-                with (patch('sys.argv', arguments), patch('torch.cuda.is_available', return_value=False),
+                with (patch('sys.argv', arguments), patch('torch.cuda.is_available', return_value=False), patch('torch.cuda.memory_allocated', return_value=0),
                       contextlib.redirect_stdout(io.StringIO()),
                       self.assertRaisesRegex(RuntimeError, 'CUDA GPU')):
                     main()
