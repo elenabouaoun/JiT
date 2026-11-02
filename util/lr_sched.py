@@ -2,7 +2,13 @@ import math
 
 
 def adjust_learning_rate(optimizer, epoch, args):
-    """Decay the learning rate with half-cycle cosine after warmup"""
+    """Epoch schedule sampled at optimizer-update starts, not microbatch starts.
+
+    The caller supplies epoch + update_index / ceil(microbatches / accum_steps).
+    Thus warmup_epochs and epochs retain their epoch meaning under accumulation;
+    a short final window counts as one update. The first update uses progress zero
+    and the final training update precedes the exact cosine endpoint.
+    """
     if epoch < args.warmup_epochs:
         lr = args.lr * epoch / args.warmup_epochs 
     else:

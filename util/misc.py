@@ -5,6 +5,7 @@ import time
 from collections import defaultdict, deque
 from pathlib import Path
 import copy
+import tempfile
 
 import torch
 import torch.distributed as dist
@@ -197,9 +198,9 @@ def is_main_process():
     return get_rank() == 0
 
 
-def save_on_master(*args, **kwargs):
+def save_on_master(state, path):
     if is_main_process():
-        torch.save(*args, **kwargs)
+        save_checkpoint_exclusive(state, path)
 
 
 def init_distributed_mode(args):
@@ -252,9 +253,45 @@ def add_weight_decay(model, weight_decay=0, skip_list=()):
         {'params': decay, 'weight_decay': weight_decay}]
 
 
+def create_output_directory(path):
+    """Collectively reserve a new directory; report rank-zero failures to peers."""
+    error = [None]
+    if is_main_process():
+        try:
+            Path(path).mkdir(parents=True, exist_ok=False)
+        except OSError as exception:
+            error[0] = str(exception)
+    if is_dist_avail_and_initialized():
+        dist.broadcast_object_list(error, src=0)
+    if error[0] is not None:
+        raise RuntimeError(f'Output directory must be new: {error[0]}')
+
+
+def save_checkpoint_exclusive(state, path):
+    """Publish a complete checkpoint atomically without replacing any pathname."""
+    path = Path(path)
+    if path.exists() or path.is_symlink():
+        raise FileExistsError(f'Refusing to overwrite checkpoint: {path}')
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=path.parent, prefix='.checkpoint-', delete=False) as stream:
+            temporary = Path(stream.name)
+            torch.save(state, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        # Unlike rename/replace, link fails if a concurrent writer created path.
+        # Both names are on the same filesystem. Unsupported links fail safely.
+        os.link(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
 def save_model(args, model_without_ddp, optimizer, epoch, epoch_name=None):
+    if not is_main_process():
+        return
     if epoch_name is None:
-        epoch_name = str(epoch)
+        epoch_name = f'epoch{epoch:06d}'
     output_dir = Path(args.output_dir)
     checkpoint_path = output_dir / ('checkpoint-%s.pth' % epoch_name)
 
@@ -275,7 +312,7 @@ def save_model(args, model_without_ddp, optimizer, epoch, epoch_name=None):
     to_save['model_ema1'] = ema_state_dict1
     to_save['model_ema2'] = ema_state_dict2
 
-    save_on_master(to_save, checkpoint_path)
+    save_checkpoint_exclusive(to_save, checkpoint_path)
 
 
 def all_reduce_mean(x):

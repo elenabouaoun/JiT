@@ -20,6 +20,12 @@ from engine_jit import train_one_epoch, evaluate
 from denoiser import Denoiser
 
 
+def effective_batch_size(args, world_size):
+    if args.batch_size < 1 or args.accum_steps < 1 or world_size < 1:
+        raise ValueError('batch_size, accum_steps and world_size must be positive')
+    return args.batch_size * args.accum_steps * world_size
+
+
 def get_args_parser():
     parser = argparse.ArgumentParser('JiT', add_help=False)
 
@@ -36,6 +42,8 @@ def get_args_parser():
                         help='Epochs to warm up LR')
     parser.add_argument('--batch_size', default=128, type=int,
                         help='Batch size per GPU (effective batch size = batch_size * # GPUs)')
+    parser.add_argument('--accum_steps', default=1, type=int,
+                        help='Microbatches per optimizer and EMA update')
     parser.add_argument('--lr', type=float, default=None, metavar='LR',
                         help='Learning rate (absolute)')
     parser.add_argument('--blr', type=float, default=5e-5, metavar='LR',
@@ -94,7 +102,7 @@ def get_args_parser():
     parser.add_argument('--output_dir', default='./output_dir',
                         help='Directory to save outputs (empty for no saving)')
     parser.add_argument('--resume', default='',
-                        help='Folder that contains checkpoint to resume from')
+                        help='Explicit checkpoint file, or legacy folder containing checkpoint-last.pth')
     parser.add_argument('--save_last_freq', type=int, default=5,
                         help='Frequency (in epochs) to save checkpoints')
     parser.add_argument('--log_freq', default=100, type=int)
@@ -113,6 +121,7 @@ def get_args_parser():
 
 
 def main(args):
+    effective_batch_size(args, 1)  # Validate before distributed initialization.
     misc.init_distributed_mode(args)
     print('Job directory:', os.path.dirname(os.path.realpath(__file__)))
     print("Arguments:\n{}".format(args).replace(', ', ',\n'))
@@ -129,9 +138,10 @@ def main(args):
     num_tasks = misc.get_world_size()
     global_rank = misc.get_rank()
 
-    # Set up TensorBoard logging (only on main process)
+    # Resumes read old artifacts and must write into a fresh output directory.
+    if args.output_dir is not None:
+        misc.create_output_directory(args.output_dir)
     if global_rank == 0 and args.output_dir is not None:
-        os.makedirs(args.output_dir, exist_ok=True)
         log_writer = SummaryWriter(log_dir=args.output_dir)
     else:
         log_writer = None
@@ -171,7 +181,7 @@ def main(args):
 
     model.to(device)
 
-    eff_batch_size = args.batch_size * misc.get_world_size()
+    eff_batch_size = effective_batch_size(args, misc.get_world_size())
     if args.lr is None:  # only base_lr (blr) is specified
         args.lr = args.blr * eff_batch_size / 256
 
@@ -188,8 +198,8 @@ def main(args):
     print(optimizer)
 
     # Resume from checkpoint if provided
-    checkpoint_path = os.path.join(args.resume, "checkpoint-last.pth") if args.resume else None
-    if checkpoint_path and os.path.exists(checkpoint_path):
+    checkpoint_path = resolve_resume_checkpoint(args.resume)
+    if checkpoint_path:
         checkpoint = torch.load(checkpoint_path, map_location='cpu')
         model_without_ddp.load_state_dict(checkpoint['model'])
 
@@ -228,16 +238,8 @@ def main(args):
         train_one_epoch(model, model_without_ddp, data_loader_train, optimizer, device, epoch, log_writer=log_writer, args=args)
 
         # Save checkpoint periodically
-        if epoch % args.save_last_freq == 0 or epoch + 1 == args.epochs:
-            misc.save_model(
-                args=args,
-                model_without_ddp=model_without_ddp,
-                optimizer=optimizer,
-                epoch=epoch,
-                epoch_name="last"
-            )
-
-        if epoch % 100 == 0 and epoch > 0:
+        if (epoch % args.save_last_freq == 0 or epoch + 1 == args.epochs or
+                (epoch % 100 == 0 and epoch > 0)):
             misc.save_model(
                 args=args,
                 model_without_ddp=model_without_ddp,
@@ -260,7 +262,17 @@ def main(args):
     print('Training time:', total_time_str)
 
 
+def resolve_resume_checkpoint(resume):
+    if not resume:
+        return None
+    path = Path(resume).expanduser()
+    if path.is_dir():
+        path = path / 'checkpoint-last.pth'
+    if not path.is_file():
+        raise FileNotFoundError(f'Requested resume checkpoint does not exist: {path}')
+    return path
+
+
 if __name__ == '__main__':
     args = get_args_parser().parse_args()
-    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     main(args)

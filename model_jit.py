@@ -92,16 +92,9 @@ class LabelEmbedder(nn.Module):
 
 
 def scaled_dot_product_attention(query, key, value, dropout_p=0.0) -> torch.Tensor:
-    L, S = query.size(-2), key.size(-2)
-    scale_factor = 1 / math.sqrt(query.size(-1))
-    attn_bias = torch.zeros(query.size(0), 1, L, S, dtype=query.dtype).cuda()
-
-    with torch.cuda.amp.autocast(enabled=False):
-        attn_weight = query.float() @ key.float().transpose(-2, -1) * scale_factor
-    attn_weight += attn_bias
-    attn_weight = torch.softmax(attn_weight, dim=-1)
-    attn_weight = torch.dropout(attn_weight, dropout_p, train=True)
-    return attn_weight @ value
+    # CUDA selects a fused backend when supported; CPU uses the math backend.
+    # Pilots explicitly require FlashAttention so a dense fallback cannot hide OOM risk.
+    return F.scaled_dot_product_attention(query, key, value, dropout_p=dropout_p)
 
 
 class Attention(nn.Module):
@@ -172,7 +165,7 @@ class FinalLayer(nn.Module):
             nn.Linear(hidden_size, 2 * hidden_size, bias=True)
         )
 
-    @torch.compile
+    # @torch.compile (disabled for Hellbender)
     def forward(self, x, c):
         shift, scale = self.adaLN_modulation(c).chunk(2, dim=1)
         x = modulate(self.norm_final(x), shift, scale)
@@ -194,7 +187,7 @@ class JiTBlock(nn.Module):
             nn.Linear(hidden_size, 6 * hidden_size, bias=True)
         )
 
-    @torch.compile
+    # @torch.compile (disabled for Hellbender)
     def forward(self, x,  c, feat_rope=None):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=-1)
         x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa), rope=feat_rope)
@@ -359,13 +352,28 @@ class JiT(nn.Module):
         return output
 
 
-def JiT_B_16(**kwargs):
+def _jit_b(patch_size, **kwargs):
     return JiT(depth=12, hidden_size=768, num_heads=12,
-               bottleneck_dim=128, in_context_len=32, in_context_start=4, patch_size=16, **kwargs)
+               bottleneck_dim=128, in_context_len=32, in_context_start=4, patch_size=patch_size, **kwargs)
+
+
+def JiT_B_2(**kwargs):
+    return _jit_b(2, **kwargs)
+
+
+def JiT_B_4(**kwargs):
+    return _jit_b(4, **kwargs)
+
+
+def JiT_B_8(**kwargs):
+    return _jit_b(8, **kwargs)
+
+
+def JiT_B_16(**kwargs):
+    return _jit_b(16, **kwargs)
 
 def JiT_B_32(**kwargs):
-    return JiT(depth=12, hidden_size=768, num_heads=12,
-               bottleneck_dim=128, in_context_len=32, in_context_start=4, patch_size=32, **kwargs)
+    return _jit_b(32, **kwargs)
 
 def JiT_L_16(**kwargs):
     return JiT(depth=24, hidden_size=1024, num_heads=16,
@@ -385,6 +393,9 @@ def JiT_H_32(**kwargs):
 
 
 JiT_models = {
+    'JiT-B/2': JiT_B_2,
+    'JiT-B/4': JiT_B_4,
+    'JiT-B/8': JiT_B_8,
     'JiT-B/16': JiT_B_16,
     'JiT-B/32': JiT_B_32,
     'JiT-L/16': JiT_L_16,
